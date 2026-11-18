@@ -160,6 +160,11 @@ body.locked > .wrap { visibility:hidden; }
     <p id="authMessage">Googleアカウントのログイン状態を確認しています…</p>
     <button type="button" id="googleLogin" style="display:none">Googleでログイン</button>
     <div id="approvalInfo" style="display:none;text-align:left;margin-top:12px;font-size:13px;line-height:1.7;color:#475569">初回の招待コード承認は、サーバー側の検証機能を準備中です。現在の公開サイトをそのまま利用してください。</div>
+    <div id="inviteBox" style="display:none;text-align:left;margin-top:14px">
+      <label for="inviteCode" style="font-size:13px;color:#475569">初回登録用の招待コード</label>
+      <input id="inviteCode" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="招待コードを入力・貼り付け" style="margin:8px 0 10px">
+      <button type="button" id="approveUser">招待コードで承認登録</button>
+    </div>
     <button type="button" id="googleLogout" style="display:none;margin-top:10px;background:#e5eaf1;color:#123b68">ログアウト</button>
     <div id="passwordError" class="password-error" role="alert"></div>
   </div>
@@ -252,12 +257,62 @@ body.locked > .wrap { visibility:hidden; }
   const info=$('approvalInfo'), error=$('passwordError');
   const gate=$('passwordGate'), postForm=$('announcementForm');
   const postInput=$('announcementInput'), postList=$('announcementList');
-  let unsubscribe=null, currentUser=null, admin=false;
+  const apiUrl='https://script.google.com/macros/s/AKfycbz6r9brPWVCpEOcZSyweoK4etCJ2_OkkEWjceUaOQO0VP-Z99yW9idg4CcJARi2cII5Aw/exec';
+  const inviteBox=$('inviteBox'), inviteCode=$('inviteCode'), approveButton=$('approveUser');
+  let unsubscribe=null, currentUser=null, admin=false, authRevision=0;
   function say(t){msg.textContent=t;}
   function lock(){gate.style.display='flex';document.body.classList.add('locked');postForm.style.display='none';}
   function unlock(){gate.style.display='none';document.body.classList.remove('locked');postForm.style.display=admin?'flex':'none';}
+  function showInvite(t){lock();say(t);inviteBox.style.display='block';info.style.display='none';}
+  async function requestApproval(action,user,code){
+    const idToken=await user.getIdToken();
+    const response=await fetch(apiUrl,{
+      method:'POST',redirect:'follow',
+      headers:{'Content-Type':'text/plain;charset=UTF-8'},
+      body:JSON.stringify({action,idToken,...(action==='approveUser'?{inviteCode:code}:{})})
+    });
+    if(!response.ok)throw new Error('通信エラー（HTTP '+response.status+'）');
+    let data;
+    try{data=await response.json()}catch{throw new Error('サーバーの応答を読み取れませんでした')}
+    if(data.success!==true)throw new Error('承認確認に失敗しました。招待コードまたはサーバー設定を確認してください。');
+    return data.result;
+  }
+  function beginPosts(){
+    if(unsubscribe){unsubscribe();unsubscribe=null}
+    unsubscribe=db.collection('hguAnnouncements').orderBy('createdAt','desc').limit(40).onSnapshot(showPosts,err=>{postList.textContent='お知らせの取得に失敗しました: '+err.message});
+  }
   login.onclick=async()=>{error.textContent='';try{await auth.signInWithPopup(new firebase.auth.GoogleAuthProvider())}catch(e){error.textContent='ログインできませんでした: '+e.message}};
   logout.onclick=()=>auth.signOut();
+  approveButton.onclick=async()=>{
+    const user=auth.currentUser, code=inviteCode.value;
+    if(!user){error.textContent='Googleログインが必要です。';return}
+    if(!code){error.textContent='招待コードを入力してください。';return}
+    approveButton.disabled=true;error.textContent='';say('招待コードを確認しています…');
+    const revision=authRevision;
+    try{
+      const result=await requestApproval('approveUser',user,code);
+      if(revision!==authRevision)return;
+      if(result?.approved!==true)throw new Error('承認結果を確認できませんでした');
+      inviteCode.value='';inviteBox.style.display='none';
+      say('承認登録が完了しました。');
+      await checkUser(user,revision);
+    }catch(e){if(revision===authRevision){showInvite('初回承認が必要です。');error.textContent=e.message}}
+    finally{approveButton.disabled=false}
+  };
+  async function checkUser(user,revision){
+    if(revision!==authRevision)return;
+    say('承認状態を確認しています…');
+    try{
+      const result=await requestApproval('checkApproval',user);
+      if(revision!==authRevision)return;
+      if(result?.approved===true){
+        // 権限は承認情報のroleを使用し、メールアドレスだけでは編集を許可しない
+        admin=result.role==='analyst' && (user.email||'').toLowerCase()===analyst && user.emailVerified;
+        inviteBox.style.display='none';info.style.display='none';error.textContent='';
+        unlock();beginPosts();
+      }else{admin=false;showInvite('未承認のアカウントです。初回のみ招待コードを入力してください。')}
+    }catch(e){if(revision===authRevision){admin=false;lock();say('承認状態を確認できませんでした。');error.textContent=e.message}}
+  }
   function showPosts(snapshot){postList.replaceChildren();if(snapshot.empty){postList.textContent='お知らせはまだありません。';return;}
     snapshot.docs.forEach(doc=>{const d=doc.data();const article=document.createElement('article');article.className='announcement-item';
       const date=document.createElement('div');date.className='announcement-date';date.textContent=d.createdAt?.toDate?.().toLocaleString('ja-JP')||'';
@@ -271,16 +326,12 @@ body.locked > .wrap { visibility:hidden; }
     try{await db.collection('hguAnnouncements').add({text,createdAt:firebase.firestore.FieldValue.serverTimestamp()});postInput.value=''}catch(err){alert('投稿できませんでした: '+err.message)}
   };
   auth.onAuthStateChanged(async user=>{
-    if(unsubscribe){unsubscribe();unsubscribe=null}lock();currentUser=user;admin=false;error.textContent='';
+    const revision=++authRevision;
+    if(unsubscribe){unsubscribe();unsubscribe=null}
+    lock();currentUser=user;admin=false;error.textContent='';inviteBox.style.display='none';
     login.style.display=user?'none':'block';logout.style.display=user?'block':'none';info.style.display='none';
     if(!user){say('Googleアカウントでログインしてください。');return}
-    admin=(user.email||'').toLowerCase()===analyst && user.emailVerified;
-    if(!admin){
-      say('選手の初回承認機能は準備中です。現時点では公開しないでください。');
-      info.style.display='block';return;
-    }
-    say('アナリストとして認証しました。');unlock();
-    unsubscribe=db.collection('hguAnnouncements').orderBy('createdAt','desc').limit(40).onSnapshot(showPosts,err=>{postList.textContent='お知らせの取得に失敗しました: '+err.message});
+    await checkUser(user,revision);
   });
 })();
 </script>\n</body>
